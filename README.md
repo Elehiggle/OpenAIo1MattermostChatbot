@@ -115,7 +115,6 @@ docker run -d --name chatbotgpt \
   -e AI_MODEL="o1-preview" \
   -e MATTERMOST_URL="mattermostinstance.example.com" \
   -e MATTERMOST_TOKEN="your_mattermost_token" \
-  -e MAX_TOKENS="4096" \
   -e TEMPERATURE="1" \
   ghcr.io/elehiggle/openaio1mattermostchatbot:latest
 ```
