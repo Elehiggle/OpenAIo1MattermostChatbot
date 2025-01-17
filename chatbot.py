@@ -59,9 +59,8 @@ model_encoder = tiktoken.encoding_for_model("gpt-4o")
 thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 
-def get_system_instructions():
-    current_time = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    return system_prompt_unformatted.format(current_time=current_time, CHATBOT_USERNAME=CHATBOT_USERNAME)
+def get_system_instructions(initial_time):
+    return system_prompt_unformatted.format(current_time=initial_time, CHATBOT_USERNAME=CHATBOT_USERNAME)
 
 
 @lru_cache(maxsize=1000)
@@ -97,6 +96,7 @@ def send_typing_indicator_loop(user_id, channel_id, parent_id, stop_event):
 
 
 def handle_typing_indicator(user_id, channel_id, parent_id):
+    logger.debug("Starting typing indicator")
     stop_typing_event = threading.Event()
     typing_indicator_thread = threading.Thread(
         target=send_typing_indicator_loop,
@@ -106,17 +106,16 @@ def handle_typing_indicator(user_id, channel_id, parent_id):
     return stop_typing_event, typing_indicator_thread
 
 
-def handle_text_generation(current_message, messages, channel_id, root_id):
+def handle_text_generation(current_message, messages, channel_id, root_id, initial_time):
+    system_instructions = get_system_instructions(initial_time)
+
     # Send the messages to the AI API
     response = ai_client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": get_system_instructions()}, *messages],
+        messages=[{"role": "user", "content": system_instructions}, *messages],
         timeout=timeout,
         temperature=temperature,
     )
-
-    prompt_tokens = response.usage.prompt_tokens
-    completion_tokens = response.usage.completion_tokens
 
     response_text = response.choices[0].message.content
 
@@ -135,18 +134,11 @@ def handle_text_generation(current_message, messages, channel_id, root_id):
         # Send the API response back to the Mattermost channel as a reply to the thread or as a new thread
         driver.posts.create_post({"channel_id": channel_id, "message": part, "root_id": root_id})
 
-    prompt_tokens_cost = 5 / 1_000_000 * prompt_tokens
-    completion_tokens_cost = 15 / 1_000_000 * completion_tokens
-    tokens_cost_total = prompt_tokens_cost + completion_tokens_cost
-    logger.debug(
-        f"Text Token cost: ${tokens_cost_total:.4f} | Input ${prompt_tokens_cost:.4f} ({prompt_tokens}) + Output ${completion_tokens_cost:.4f} ({completion_tokens})"
-    )
 
-
-def handle_generation(current_message, messages, channel_id, root_id):
+def handle_generation(current_message, messages, channel_id, root_id, initial_time):
     try:
         logger.info("Querying AI API")
-        handle_text_generation(current_message, messages, channel_id, root_id)
+        handle_text_generation(current_message, messages, channel_id, root_id, initial_time)
     except Exception as e:
         logger.error(f"Text generation error: {str(e)} {traceback.format_exc()}")
         driver.posts.create_post(
@@ -184,10 +176,17 @@ def process_message(event_data):
 
             if root_id:
                 thread_messages = get_thread_posts(root_id, post_id)
-
-            # If we don't have any thread, add our own message to the array
-            if not root_id:
+                root_post = driver.posts.get_post(root_id)
+                posted_at = root_post["create_at"]
+            else:
+                # If we don't have any thread, add our own message to the array
                 thread_messages.append((post, sender_name, "user", current_message))
+                posted_at = post["create_at"]
+
+            current_time_utc = datetime.datetime.now(datetime.UTC)
+            post_time_utc = datetime.datetime.fromtimestamp(posted_at / 1000.0, tz=datetime.UTC)
+            initial_time = min(current_time_utc, post_time_utc).strftime("%Y-%m-%d %H:%M:%S.%f")[
+                           :-3]  # Gets the UTC time of the root post
 
             for index, thread_message in enumerate(thread_messages):
                 content = {}
@@ -243,7 +242,7 @@ def process_message(event_data):
                     messages.append(construct_text_message(thread_sender_name, thread_role, content))
 
             # If the message is not part of a thread, reply to it to create a new thread
-            handle_generation(current_message, messages, channel_id, post_id if not root_id else root_id)
+            handle_generation(current_message, messages, channel_id, post_id if not root_id else root_id, initial_time)
     except Exception as e:
         logger.error(f"Error processing message: {str(e)} {traceback.format_exc()}")
         if chatbot_invoked:
@@ -251,6 +250,8 @@ def process_message(event_data):
                 {"channel_id": channel_id, "message": f"Process message error occurred: {str(e)}", "root_id": root_id}
             )
     finally:
+        logger.debug("Clearing cache and stopping typing indicator")
+
         get_raw_thread_posts.cache_clear()  # We clear this cache as it won't be useful for the next message with the current implementation
         if stop_typing_event:
             stop_typing_event.set()
@@ -596,7 +597,9 @@ def request_link_content(link):
     with httpx.Client() as client:
         # By doing the redirect itself, we might already allow a local request?
         with client.stream("GET", link, timeout=4, follow_redirects=True) as response:
-            response.raise_for_status()
+            # Raise for bad status codes if we don't have a FlareSolverr endpoint, this can cause issues though if the requested content is not text
+            if not flaresolverr_endpoint:
+                response.raise_for_status()
 
             final_url = str(response.url)
 
@@ -637,14 +640,16 @@ def main():
         CHATBOT_USERNAME = driver.client.username
         CHATBOT_USERNAME_AT = f"@{CHATBOT_USERNAME}"
 
-        logger.debug(f"SYSTEM PROMPT: {get_system_instructions()}")
+        system_instructions = get_system_instructions(
+            datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
+        logger.debug(f"SYSTEM PROMPT: {system_instructions}")
 
         while True:
             try:
                 # Initialize the WebSocket connection
                 driver.init_websocket(message_handler)
             except Exception as e:
-                logger.error(f"Error initializing WebSocket: {str(e)} {traceback.format_exc()}")
+                logger.error(f"Error with WebSocket: {str(e)} {traceback.format_exc()}")
             time.sleep(2)
 
     except KeyboardInterrupt:
